@@ -162,6 +162,27 @@ PriceGhost has **site-specific scrapers** optimized for:
 
 **Any other site** works via generic extraction + AI fallback.
 
+### Brazilian retailers (this fork)
+
+Site-specific, pt-BR aware scrapers, all verified against live product pages:
+
+| Retailer | Browser Rendering | Logged-in Profile | Notes |
+|----------|-------------------|-------------------|-------|
+| Kabum | No | No | Reads `__NEXT_DATA__`; skips the instalment amount |
+| Terabyte | Yes (Cloudflare) | No | Cash/PIX price, not the card total |
+| Pichau | Yes (Cloudflare) | No | Cash/PIX price — its JSON-LD carries the card total |
+| Amazon .com.br | Yes | **Yes** | Clean profiles get a 200 bot-wall page |
+| Mercado Livre | Yes | **Yes** | Clean profiles are bounced to account verification |
+| OLX | Yes (Cloudflare) | No | Classifieds; expired ads report as out of stock |
+| Shopee | — | — | Blocked: anti-bot payload + captcha on its price API |
+| Magazine Luiza | — | — | Unsupported: 403 on every path tried |
+
+Brazilian stores quote two prices — cash ("à vista", with a PIX/boleto discount) and a higher
+card/instalment total. These scrapers track **the cash price**, and are ranked above JSON-LD
+because on Pichau and OLX the structured data carries the wrong one.
+
+Full measurement write-up, including the BRL parsing fixes, in **[docs/LOJAS-BR.md](docs/LOJAS-BR.md)**.
+
 ## Tech Stack
 
 | Layer | Technology |
@@ -381,7 +402,7 @@ To avoid getting blocked by retailers:
 
 - **Staggered checking** - Products are checked at randomized intervals with ±5 minute jitter
 - **Request delays** - 2-5 second random delay between checking different products
-- **Reasonable intervals** - Default 1 hour; use longer intervals if tracking many products
+- **Reasonable intervals** - Default 24 hours (one check per product per day); shorten it per product when you need to watch something closely
 - **Browser headers** - Requests use standard browser User-Agent strings
 - **5-minute warning** - UI warns when selecting aggressive check intervals
 

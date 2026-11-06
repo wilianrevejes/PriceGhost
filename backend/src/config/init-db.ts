@@ -25,7 +25,7 @@ const initDatabase = async () => {
         url TEXT NOT NULL,
         name VARCHAR(255),
         image_url TEXT,
-        refresh_interval INTEGER DEFAULT 3600,
+        refresh_interval INTEGER DEFAULT 86400,
         last_checked TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(user_id, url)

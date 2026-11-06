@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS products (
   url TEXT NOT NULL,
   name VARCHAR(255),
   image_url TEXT,
-  refresh_interval INTEGER DEFAULT 3600,
+  refresh_interval INTEGER DEFAULT 86400,
   last_checked TIMESTAMP,
   next_check_at TIMESTAMP,
   stock_status VARCHAR(20) DEFAULT 'unknown',
@@ -96,6 +96,11 @@ BEGIN
     ALTER TABLE products ADD COLUMN notify_back_in_stock BOOLEAN DEFAULT false;
   END IF;
 END $$;
+
+-- Migration: default check interval is one day (CREATE TABLE above does not
+-- change a default on a database that already exists). Existing rows keep
+-- whatever interval they were given.
+ALTER TABLE products ALTER COLUMN refresh_interval SET DEFAULT 86400;
 
 -- Migration: Add next_check_at column for staggered checking
 DO $$

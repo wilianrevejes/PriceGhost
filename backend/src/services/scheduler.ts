@@ -12,12 +12,18 @@ async function checkPrices(): Promise<void> {
   }
 
   isRunning = true;
-  console.log('Starting scheduled price check...');
+  // The cron tick is a poll, not a collection run: with the default daily
+  // interval most ticks have nothing to do. Stay quiet on those instead of
+  // printing two lines a minute.
+  let anyDue = false;
 
   try {
     // Find all products that are due for a refresh
     const products = await productQueries.findDueForRefresh();
-    console.log(`Found ${products.length} products to check`);
+    if (products.length === 0) return;
+
+    anyDue = true;
+    console.log(`Starting scheduled price check: ${products.length} products due`);
 
     for (const product of products) {
       try {
@@ -229,17 +235,20 @@ async function checkPrices(): Promise<void> {
     console.error('Error in scheduled price check:', error);
   } finally {
     isRunning = false;
-    console.log('Scheduled price check complete');
+    if (anyDue) console.log('Scheduled price check complete');
   }
 }
 
 export function startScheduler(): void {
-  // Run every minute
+  // Every minute is the POLL rate, not the check rate: a tick only scrapes the
+  // products whose next_check_at has passed. With the default refresh_interval
+  // of 86400s each product is scraped once a day; the minute poll is what
+  // spreads the catalogue out instead of collecting it in one burst.
   cron.schedule('* * * * *', () => {
     checkPrices().catch(console.error);
   });
 
-  console.log('Price check scheduler started (runs every minute)');
+  console.log('Price check scheduler started (polls every minute; default interval 24h per product)');
 }
 
 // Allow manual trigger for testing

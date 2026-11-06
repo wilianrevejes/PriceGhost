@@ -49,7 +49,7 @@ async function runMigrations() {
         url TEXT NOT NULL,
         name VARCHAR(255),
         image_url TEXT,
-        refresh_interval INTEGER DEFAULT 3600,
+        refresh_interval INTEGER DEFAULT 86400,
         last_checked TIMESTAMP,
         next_check_at TIMESTAMP,
         stock_status VARCHAR(20) DEFAULT 'unknown',
@@ -213,6 +213,13 @@ async function runMigrations() {
       END $$;
     `);
 
+    // Default check interval is one day. CREATE TABLE IF NOT EXISTS above does
+    // not touch a column default on a database that already exists, so set it
+    // here. Existing rows keep whatever interval they were given.
+    await client.query(`
+      ALTER TABLE products ALTER COLUMN refresh_interval SET DEFAULT 86400
+    `);
+
     // Create notification_history table for tracking all triggered notifications
     await client.query(`
       CREATE TABLE IF NOT EXISTS notification_history (
@@ -295,9 +302,15 @@ async function startServer() {
     app.listen(PORT, () => {
       console.log(`PriceGhost API server running on port ${PORT}`);
 
-      // Start the background price checker
-      if (process.env.NODE_ENV !== 'test') {
+      // Start the background price checker.
+      // DISABLE_SCHEDULER=true boots the API without it, which is what you
+      // want while migrating or importing a catalogue: imported products are
+      // due immediately, so a normal boot starts scraping hundreds of pages.
+      const schedulerDisabled = process.env.DISABLE_SCHEDULER === 'true';
+      if (process.env.NODE_ENV !== 'test' && !schedulerDisabled) {
         startScheduler();
+      } else if (schedulerDisabled) {
+        console.log('Price check scheduler disabled (DISABLE_SCHEDULER=true)');
       }
     });
   } catch (error) {

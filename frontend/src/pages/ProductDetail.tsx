@@ -43,7 +43,7 @@ export default function ProductDetail() {
     { value: 14400, label: '4 hours' },
     { value: 21600, label: '6 hours' },
     { value: 43200, label: '12 hours' },
-    { value: 86400, label: '24 hours' },
+    { value: 86400, label: '24 hours (default)' },
   ];
 
   const productId = parseInt(id || '0', 10);

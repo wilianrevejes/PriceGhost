@@ -13,12 +13,12 @@ const REFRESH_INTERVALS = [
   { value: 7200, label: '2 hours' },
   { value: 21600, label: '6 hours' },
   { value: 43200, label: '12 hours' },
-  { value: 86400, label: '24 hours' },
+  { value: 86400, label: '24 hours (default)' },
 ];
 
 export default function ProductForm({ onSubmit }: ProductFormProps) {
   const [url, setUrl] = useState('');
-  const [refreshInterval, setRefreshInterval] = useState(3600);
+  const [refreshInterval, setRefreshInterval] = useState(86400);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
 

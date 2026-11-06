@@ -7,6 +7,19 @@ import {
   ParsedPrice,
   findMostLikelyPrice,
 } from '../utils/priceParser';
+import {
+  brSiteScrapers,
+  brStockStatusFromText,
+  brPageNotFound,
+  brStoreFor,
+  pageLocale,
+  brUnsupportedReason,
+  brWaitSelector,
+  shopeeIds,
+  BR_SITE_CONFIDENCE,
+  BR_BROWSER_SITES,
+  BR_LOGGED_PROFILE_SITES,
+} from './scrapers-br';
 
 // Add stealth plugin to avoid bot detection (Cloudflare, etc.)
 puppeteer.use(StealthPlugin());
@@ -86,8 +99,35 @@ function findPriceConsensus(candidates: PriceCandidate[]): { price: PriceCandida
   return { price: winner, hasConsensus, groups };
 }
 
+// Number/currency convention of the page being parsed, from pageLocale().
+// Threaded into every extractor that has to guess a currency: the fallback
+// used to be a hardcoded 'USD', which mislabelled every Brazilian store
+// outside scrapers-br.ts — and the imported price-tracker catalogue spans 53
+// Brazilian hosts, only six of which have a site-specific scraper.
+type PageLocale = ReturnType<typeof pageLocale>;
+
+/**
+ * Currency named by the text around a price, else the page's own.
+ * 'R$' is tested before the bare symbols because it contains '$' — the same
+ * ordering priceParser.ts depends on.
+ */
+function currencyFromText(sources: Array<string | undefined>, locale: PageLocale): string {
+  for (const source of sources) {
+    if (!source) continue;
+    if (/R\$/.test(source)) return 'BRL';
+    const codeMatch = source.match(/\b(BRL|CHF|EUR|GBP|USD|CAD|AUD|JPY|INR)\b/i);
+    if (codeMatch) return codeMatch[1].toUpperCase();
+    const symbolMatch = source.match(/([$€£¥₹])/);
+    if (symbolMatch) {
+      const symbolMap: Record<string, string> = { '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR' };
+      return symbolMap[symbolMatch[1]] || locale.currency;
+    }
+  }
+  return locale.currency;
+}
+
 // Extract price candidates from JSON-LD structured data
-function extractJsonLdCandidates($: CheerioAPI): PriceCandidate[] {
+function extractJsonLdCandidates($: CheerioAPI, locale: PageLocale): PriceCandidate[] {
   const candidates: PriceCandidate[] = [];
   try {
     const scripts = $('script[type="application/ld+json"]');
@@ -101,7 +141,7 @@ function extractJsonLdCandidates($: CheerioAPI): PriceCandidate[] {
       if (product?.offers) {
         const offer = Array.isArray(product.offers) ? product.offers[0] : product.offers;
         const priceValue = offer.lowPrice || offer.price || offer.priceSpecification?.price;
-        const currency = offer.priceCurrency || offer.priceSpecification?.priceCurrency || 'USD';
+        const currency = offer.priceCurrency || offer.priceSpecification?.priceCurrency || locale.currency;
 
         if (priceValue) {
           const price = parseFloat(String(priceValue));
@@ -124,7 +164,7 @@ function extractJsonLdCandidates($: CheerioAPI): PriceCandidate[] {
 }
 
 // Extract price candidates from site-specific scraper
-function extractSiteSpecificCandidates($: CheerioAPI, url: string): { candidates: PriceCandidate[]; name: string | null; imageUrl: string | null; stockStatus: StockStatus } {
+function extractSiteSpecificCandidates($: CheerioAPI, url: string, locale: PageLocale): { candidates: PriceCandidate[]; name: string | null; imageUrl: string | null; stockStatus: StockStatus } {
   const candidates: PriceCandidate[] = [];
   let name: string | null = null;
   let imageUrl: string | null = null;
@@ -140,25 +180,43 @@ function extractSiteSpecificCandidates($: CheerioAPI, url: string): { candidates
       allPrices?: ParsedPrice[];  // Some scrapers return multiple prices (e.g., Amazon)
     };
 
+    // A Brazilian store's structured data routinely carries the installment
+    // total (Pichau) or a figure left stale by a seller edit (OLX) rather than
+    // the advertised cash price, so there the site-specific extractor outranks
+    // JSON-LD's 0.9 instead of sitting below it. See services/scrapers-br.ts.
+    const brStore = brStoreFor(url);
+    const confidence = brStore ? BR_SITE_CONFIDENCE : 0.85;
+    const context = brStore
+      ? `${brStore} extractor (preço à vista)`
+      : `Site-specific extractor for ${new URL(url).hostname}`;
+
+    // Amazon .com.br is read by the upstream Amazon scraper, which calls
+    // parsePrice with no locale: a price written without "R$" in its element
+    // comes back labelled USD (measured: a USD 1711 candidate next to the
+    // correct BRL 1625.45 on the same page). Nothing priced in dollars is sold
+    // on a .com.br storefront, so on a Brazilian page the label is corrected
+    // rather than carried into the price-selection modal.
+    const currencyFor = (c: string) => (locale.currency === 'BRL' && c === 'USD' ? 'BRL' : c);
+
     // If scraper returned multiple prices, add them all as candidates
     if (siteResult.allPrices && siteResult.allPrices.length > 0) {
       for (const p of siteResult.allPrices) {
         candidates.push({
           price: p.price,
-          currency: p.currency,
+          currency: currencyFor(p.currency),
           method: 'site-specific',
-          context: `Site-specific extractor for ${new URL(url).hostname}`,
-          confidence: 0.85,
+          context,
+          confidence,
         });
       }
     } else if (siteResult.price) {
       // Single price result
       candidates.push({
         price: siteResult.price.price,
-        currency: siteResult.price.currency,
+        currency: currencyFor(siteResult.price.currency),
         method: 'site-specific',
-        context: `Site-specific extractor for ${new URL(url).hostname}`,
-        confidence: 0.85,
+        context,
+        confidence,
       });
     }
     name = siteResult.name || null;
@@ -170,13 +228,28 @@ function extractSiteSpecificCandidates($: CheerioAPI, url: string): { candidates
 }
 
 // Extract price candidates from generic CSS selectors
-function extractGenericCssCandidates($: CheerioAPI): PriceCandidate[] {
+function extractGenericCssCandidates($: CheerioAPI, locale: PageLocale): PriceCandidate[] {
   const candidates: PriceCandidate[] = [];
   const seen = new Set<number>();
+
+  // Hard cap on how many guesses this method may contribute.
+  //
+  // Why: findPriceConsensus() groups candidates by value and lets the biggest
+  // group win. A broad selector like [class*="price" i] matches every card in
+  // a "recommended products" carousel — measured at 35 candidates on a single
+  // Brazilian store page — and three unrelated carousel prices that happen to
+  // land within 5% of each other then form a group of 3 that outvotes the
+  // JSON-LD and site-specific candidates, which sit in groups of 1. The result
+  // is a confident, wrong price from a product the user is not tracking.
+  //
+  // The outer `candidates.length >= 3` break below only ran BETWEEN selectors,
+  // after .each() had already pushed every match for the current one.
+  const MAX_GENERIC_CANDIDATES = 3;
 
   for (const selector of genericPriceSelectors) {
     const elements = $(selector);
     elements.each((_, el) => {
+      if (candidates.length >= MAX_GENERIC_CANDIDATES) return false;
       const $el = $(el);
       // Skip if this looks like an "original" or "was" price
       const classAttr = $el.attr('class') || '';
@@ -198,22 +271,10 @@ function extractGenericCssCandidates($: CheerioAPI): PriceCandidate[] {
       if (priceAmount) {
         const price = parseFloat(priceAmount);
         if (!isNaN(price) && price > 0) {
-          let currency = 'USD';
-          const textSources = [text, $el.parent().text(), $el.closest('.price-box').text()];
-          for (const source of textSources) {
-            if (!source) continue;
-            const currencyCodeMatch = source.match(/\b(CHF|EUR|GBP|USD|CAD|AUD|JPY|INR)\b/i);
-            if (currencyCodeMatch) {
-              currency = currencyCodeMatch[1].toUpperCase();
-              break;
-            }
-            const symbolMatch = source.match(/([$€£¥₹])/);
-            if (symbolMatch) {
-              const symbolMap: Record<string, string> = { '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR' };
-              currency = symbolMap[symbolMatch[1]] || 'USD';
-              break;
-            }
-          }
+          const currency = currencyFromText(
+            [text, $el.parent().text(), $el.closest('.price-box').text()],
+            locale
+          );
           parsed = { price, currency };
           context = `data-price-amount attribute`;
         }
@@ -221,7 +282,7 @@ function extractGenericCssCandidates($: CheerioAPI): PriceCandidate[] {
 
       if (!parsed) {
         const priceStr = content || dataPrice || text;
-        parsed = parsePrice(priceStr);
+        parsed = parsePrice(priceStr, locale.hint, locale.currency);
         if (parsed) {
           context = text.trim().slice(0, 50);
         }
@@ -240,7 +301,7 @@ function extractGenericCssCandidates($: CheerioAPI): PriceCandidate[] {
     });
 
     // Only take first few generic candidates to avoid noise
-    if (candidates.length >= 3) break;
+    if (candidates.length >= MAX_GENERIC_CANDIDATES) break;
   }
 
   return candidates;
@@ -248,27 +309,100 @@ function extractGenericCssCandidates($: CheerioAPI): PriceCandidate[] {
 
 // Browser-based scraping for sites that block HTTP requests (e.g., Cloudflare)
 async function scrapeWithBrowser(url: string): Promise<string> {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-infobars',
-      '--disable-crash-reporter',
-      '--window-size=1920,1080',
-      '--start-maximized',
-    ],
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    ignoreDefaultArgs: ['--enable-automation'],
-  });
+  // Amazon .com.br and Mercado Livre refuse a clean stealth profile but serve
+  // a browser carrying a real, logged-in one. Point PUPPETEER_USER_DATA_DIR at
+  // that profile (on this machine: ~/.config/chromium-wsl) to unlock them.
+  const userDataDir = process.env.PUPPETEER_USER_DATA_DIR || undefined;
+  // Brazilian stores serve a different (and sometimes en-US formatted) page
+  // when the client does not ask for pt-BR. OLX in particular renders a
+  // different component tree — its headline price element never appears when
+  // navigator.language is en-US — so the locale has to be set at launch, not
+  // only through the Accept-Language header.
+  const isBrazilian = /\.com\.br(\/|$|:)/i.test(url) || /\.br\//i.test(url);
+  const needsLoggedProfile = BR_LOGGED_PROFILE_SITES.some((re) => re.test(url));
+  // Not a problem when driving a browser over CDP: that one carries its own
+  // profile, which is the point of connecting to it.
+  if (needsLoggedProfile && !userDataDir && !process.env.PUPPETEER_CDP_URL) {
+    console.warn(
+      `[Browser] ${new URL(url).hostname} normally requires a logged-in browser profile. ` +
+        'Set PUPPETEER_USER_DATA_DIR to avoid a bot wall.'
+    );
+  }
 
+  // A Chrome already running on a profile holds an exclusive lock on its
+  // directory, so launching a second one against the same PUPPETEER_USER_DATA_DIR
+  // aborts with "Failed to create SingletonLock: File exists" — which is how
+  // this fails whenever the owner has that browser open. Set PUPPETEER_CDP_URL
+  // to the running browser's debugging endpoint (`chrome-wsl --cdp` exposes
+  // http://127.0.0.1:9222) and the scraper drives that browser instead of
+  // launching its own, with the same logged-in session and no conflict.
+  const cdpUrl = process.env.PUPPETEER_CDP_URL;
+  const browser = cdpUrl
+    ? await puppeteer.connect({ browserURL: cdpUrl })
+    : await puppeteer.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-blink-features=AutomationControlled',
+          '--disable-infobars',
+          '--disable-crash-reporter',
+          '--window-size=1920,1080',
+          '--start-maximized',
+          ...(userDataDir ? ['--password-store=basic'] : []),
+          ...(isBrazilian ? ['--lang=pt-BR'] : []),
+        ],
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        userDataDir,
+        ignoreDefaultArgs: ['--enable-automation'],
+      }).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/SingletonLock|ProcessSingleton/i.test(message)) {
+          throw new Error(
+            `Chrome is already running on ${userDataDir ?? 'this profile'}; one Chrome per ` +
+              'profile directory. Close it, or set PUPPETEER_CDP_URL to drive the running ' +
+              'one (chrome-wsl --cdp). Original error: ' +
+              message
+          );
+        }
+        throw error;
+      });
+
+  let page: Awaited<ReturnType<typeof browser.newPage>> | null = null;
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
 
     // Set viewport
     await page.setViewport({ width: 1920, height: 1080 });
+
+    if (isBrazilian) {
+      await page.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' });
+    }
+
+    // Shopee renders no price into the HTML at all and its PDP API rejects a
+    // direct fetch (403 without the anti-bot signature header the page
+    // computes). Capture the page's own call and splice the payload back into
+    // the HTML, where the Shopee site scraper reads it.
+    const shopee = shopeeIds(url);
+    // Held in an object so TypeScript does not narrow it to `never`: it is
+    // only ever assigned from inside the response listener.
+    const capture: { pdp: string | null } = { pdp: null };
+    if (shopee) {
+      page.on('response', (response) => {
+        if (capture.pdp) return;
+        if (!/\/api\/v4\/pdp\/get_pc/.test(response.url())) return;
+        if (response.status() !== 200) return;
+        void response
+          .text()
+          .then((body) => {
+            if (body && (body.includes('"item"') || body.includes('"price"'))) {
+              capture.pdp = body;
+            }
+          })
+          .catch(() => undefined);
+      });
+    }
 
     // Navigate to the page and wait for content to load
     await page.goto(url, {
@@ -307,11 +441,68 @@ async function scrapeWithBrowser(url: string): Promise<string> {
     await page.evaluate('window.scrollBy(0, 300)');
     await new Promise(resolve => setTimeout(resolve, 1000));
 
+    // Brazilian stores render the price after networkidle2 resolves — OLX in
+    // particular paints the headline price late enough that page.content()
+    // would capture the page without it. Wait for a "R$ 1.234,56"-shaped
+    // string to show up, then give the layout one more tick.
+    if (isBrazilian) {
+      const waitSelector = brWaitSelector(url);
+      try {
+        if (waitSelector) {
+          await page.waitForSelector(waitSelector, { timeout: 15000 });
+        } else {
+          // Passed as a string: the backend tsconfig has no DOM lib, same
+          // reason the scroll below is a string too.
+          await page.waitForFunction(
+            '/R\\$\\s?\\d{1,3}(\\.\\d{3})*(,\\d{2})?/.test((document.body && document.body.innerText) || "")',
+            { timeout: 10000, polling: 500 }
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      } catch {
+        console.warn(
+          `[Browser] ${new URL(url).hostname}: price element did not appear` +
+            (waitSelector ? ` (${waitSelector})` : '') +
+            '; reading the page as-is.'
+        );
+      }
+    }
+
+    if (shopee) {
+      // Shopee's PDP XHR lands well after networkidle2 (measured ~8-14s), and
+      // the page can be bounced to /verify/traffic/error before it does. Nudge
+      // the page and wait for the capture BEFORE reading the HTML.
+      await page.evaluate('window.scrollBy(0, 600)').catch(() => undefined);
+      for (let i = 0; i < 18 && !capture.pdp; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
     // Get the full HTML content
-    const html = await page.content();
+    let html = await page.content();
+
+    if (shopee) {
+      if (capture.pdp) {
+        const safe = capture.pdp.replace(/<\/script/gi, '<\\/script');
+        html = html.replace(
+          '</body>',
+          `<script id="__SHOPEE_PDP__" type="application/json">${safe}</script></body>`
+        );
+      } else {
+        console.warn(`[Browser] Shopee PDP API response not captured for ${url}`);
+      }
+    }
+
     return html;
   } finally {
-    await browser.close();
+    // A browser we connected to belongs to the owner: close only our own tab
+    // and let go of it. One we launched is ours to close.
+    if (cdpUrl) {
+      await page?.close().catch(() => undefined);
+      await browser.disconnect();
+    } else {
+      await browser.close();
+    }
   }
 }
 
@@ -333,6 +524,11 @@ interface SiteScraper {
 }
 
 const siteScrapers: SiteScraper[] = [
+  // Brazilian retailers first: the Amazon matcher below also matches
+  // `amazon.com.br`, and several BR stores quote a cash ("à vista") price that
+  // the generic extractors would miss. See services/scrapers-br.ts.
+  ...brSiteScrapers,
+
   // Amazon
   {
     match: (url) => /amazon\.(com|co\.uk|ca|de|fr|es|it|co\.jp|in|com\.au)/i.test(url),
@@ -1123,6 +1319,9 @@ const genericImageSelectors = [
   'img[class*="product"]',
 ];
 
+/** Internal sentinel: the browser already produced the HTML, skip the HTTP GET. */
+class SkipHttpFetch extends Error {}
+
 export async function scrapeProduct(url: string, userId?: number): Promise<ScrapedProduct> {
   const result: ScrapedProduct = {
     name: null,
@@ -1135,17 +1334,35 @@ export async function scrapeProduct(url: string, userId?: number): Promise<Scrap
 
   let html: string = '';
 
+  const unsupported = brUnsupportedReason(url);
+  if (unsupported) {
+    throw new Error(unsupported);
+  }
+
+  // Brazilian stores that 403 plain HTTP (Terabyte, Pichau, OLX) or, worse,
+  // answer 200 with a bot-wall page that no status-code fallback can detect
+  // (Amazon .com.br, Mercado Livre, Shopee). Go straight to the browser.
+  const brNeedsBrowser = BR_BROWSER_SITES.some((re) => re.test(url));
+  const isBrazilian = /\.com\.br(\/|$|:)/i.test(url);
+
   try {
     let usedBrowser = false;
 
+    if (brNeedsBrowser) {
+      console.log(`${new URL(url).hostname} requires browser rendering, using Puppeteer...`);
+      html = await scrapeWithBrowser(url);
+      usedBrowser = true;
+    }
+
     try {
+      if (usedBrowser) throw new SkipHttpFetch();
       const response = await axios.get<string>(url, {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
           Accept:
             'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Language': isBrazilian ? 'pt-BR,pt;q=0.9,en;q=0.8' : 'en-US,en;q=0.9',
           'Accept-Encoding': 'gzip, deflate, br',
           'Cache-Control': 'no-cache',
           Pragma: 'no-cache',
@@ -1163,8 +1380,10 @@ export async function scrapeProduct(url: string, userId?: number): Promise<Scrap
       });
       html = response.data;
     } catch (axiosError) {
-      // If we get a 403 (Forbidden), try using a headless browser
-      if (axiosError instanceof AxiosError && axiosError.response?.status === 403) {
+      if (axiosError instanceof SkipHttpFetch) {
+        // Already fetched with the browser above.
+      } else if (axiosError instanceof AxiosError && axiosError.response?.status === 403) {
+        // If we get a 403 (Forbidden), try using a headless browser
         console.log(`HTTP request blocked (403) for ${url}, falling back to browser scraping...`);
         html = await scrapeWithBrowser(url);
         usedBrowser = true;
@@ -1191,7 +1410,7 @@ export async function scrapeProduct(url: string, userId?: number): Promise<Scrap
 
     // Try JSON-LD structured data
     if (!result.price || !result.name || result.stockStatus === 'unknown') {
-      const jsonLdData = extractJsonLd($);
+      const jsonLdData = extractJsonLd($, pageLocale($, url));
       if (jsonLdData) {
         if (!result.name && jsonLdData.name) result.name = jsonLdData.name;
         if (!result.price && jsonLdData.price) result.price = jsonLdData.price;
@@ -1208,7 +1427,7 @@ export async function scrapeProduct(url: string, userId?: number): Promise<Scrap
     }
 
     if (!result.price) {
-      result.price = extractGenericPrice($);
+      result.price = extractGenericPrice($, pageLocale($, url));
     }
 
     if (!result.imageUrl) {
@@ -1252,7 +1471,7 @@ export async function scrapeProduct(url: string, userId?: number): Promise<Scrap
 
         // Try JSON-LD from browser-rendered HTML
         if (!result.price) {
-          const jsonLdData = extractJsonLd($browser);
+          const jsonLdData = extractJsonLd($browser, pageLocale($browser, url));
           if (jsonLdData) {
             if (!result.name && jsonLdData.name) result.name = jsonLdData.name;
             if (!result.price && jsonLdData.price) result.price = jsonLdData.price;
@@ -1265,7 +1484,7 @@ export async function scrapeProduct(url: string, userId?: number): Promise<Scrap
 
         // Try generic extraction from browser-rendered HTML
         if (!result.price) {
-          result.price = extractGenericPrice($browser);
+          result.price = extractGenericPrice($browser, pageLocale($browser, url));
         }
         if (!result.name) {
           result.name = extractGenericName($browser);
@@ -1380,12 +1599,16 @@ export async function scrapeProductWithVoting(
 
   let html: string = '';
 
+  const isBrazilian = /\.com\.br(\/|$|:)/i.test(url);
+
   // Sites known to require JavaScript rendering
   const jsHeavySites = [
     /bestbuy\.com/i,
     /target\.com/i,
     /walmart\.com/i,
     /costco\.com/i,
+    // Brazilian stores behind Cloudflare / bot walls (see scrapers-br.ts)
+    ...BR_BROWSER_SITES,
   ];
   const requiresBrowser = jsHeavySites.some(pattern => pattern.test(url));
 
@@ -1406,7 +1629,7 @@ export async function scrapeProductWithVoting(
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
           Accept:
             'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Language': isBrazilian ? 'pt-BR,pt;q=0.9,en;q=0.8' : 'en-US,en;q=0.9',
           'Accept-Encoding': 'gzip, deflate, br',
           'Cache-Control': 'no-cache',
           Pragma: 'no-cache',
@@ -1435,17 +1658,27 @@ export async function scrapeProductWithVoting(
     }
 
     let $ = load(html);
+    let locale = pageLocale($, url);
+
+    // A dead Brazilian product URL is not an empty page: it is a 404 with a
+    // carousel of other products, every card carrying a price element. Reading
+    // one would write a confident wrong price into this product's history, so
+    // stop here and report no price. See brPageNotFound() in scrapers-br.ts.
+    if (locale.currency === 'BRL' && brPageNotFound($)) {
+      console.warn(`[Voting] ${new URL(url).hostname}: product page not found (404); no price read.`);
+      return result;
+    }
 
     // Collect candidates from all methods
     const allCandidates: PriceCandidate[] = [];
 
     // 1. JSON-LD extraction (highest reliability)
-    const jsonLdCandidates = extractJsonLdCandidates($);
+    const jsonLdCandidates = extractJsonLdCandidates($, locale);
     allCandidates.push(...jsonLdCandidates);
     console.log(`[Voting] JSON-LD found ${jsonLdCandidates.length} candidates`);
 
     // 2. Site-specific extraction
-    const siteResult = extractSiteSpecificCandidates($, url);
+    const siteResult = extractSiteSpecificCandidates($, url, locale);
     allCandidates.push(...siteResult.candidates);
     if (siteResult.name) result.name = siteResult.name;
     if (siteResult.imageUrl) result.imageUrl = siteResult.imageUrl;
@@ -1453,7 +1686,7 @@ export async function scrapeProductWithVoting(
     console.log(`[Voting] Site-specific found ${siteResult.candidates.length} candidates`);
 
     // 3. Generic CSS extraction
-    const genericCandidates = extractGenericCssCandidates($);
+    const genericCandidates = extractGenericCssCandidates($, locale);
     allCandidates.push(...genericCandidates);
     console.log(`[Voting] Generic CSS found ${genericCandidates.length} candidates`);
 
@@ -1464,17 +1697,18 @@ export async function scrapeProductWithVoting(
         html = await scrapeWithBrowser(url);
         usedBrowser = true;
         $ = load(html);
+        locale = pageLocale($, url);
 
         // Re-run all extraction methods
-        allCandidates.push(...extractJsonLdCandidates($));
-        const browserSiteResult = extractSiteSpecificCandidates($, url);
+        allCandidates.push(...extractJsonLdCandidates($, locale));
+        const browserSiteResult = extractSiteSpecificCandidates($, url, locale);
         allCandidates.push(...browserSiteResult.candidates);
         if (!result.name && browserSiteResult.name) result.name = browserSiteResult.name;
         if (!result.imageUrl && browserSiteResult.imageUrl) result.imageUrl = browserSiteResult.imageUrl;
         if (result.stockStatus === 'unknown' && browserSiteResult.stockStatus !== 'unknown') {
           result.stockStatus = browserSiteResult.stockStatus;
         }
-        allCandidates.push(...extractGenericCssCandidates($));
+        allCandidates.push(...extractGenericCssCandidates($, locale));
         console.log(`[Voting] Browser found ${allCandidates.length} total candidates`);
       } catch (browserError) {
         console.error(`[Voting] Browser fallback failed:`, browserError);
@@ -1768,7 +2002,8 @@ interface JsonLdOffer {
 }
 
 function extractJsonLd(
-  $: CheerioAPI
+  $: CheerioAPI,
+  locale: PageLocale
 ): { name?: string; price?: ParsedPrice; image?: string; stockStatus?: StockStatus } | null {
   try {
     const scripts = $('script[type="application/ld+json"]');
@@ -1796,7 +2031,7 @@ function extractJsonLd(
           // 2. price (direct)
           // 3. priceSpecification.price (nested format used by some sites)
           const priceValue = offer.lowPrice || offer.price || offer.priceSpecification?.price;
-          const currency = offer.priceCurrency || offer.priceSpecification?.priceCurrency || 'USD';
+          const currency = offer.priceCurrency || offer.priceSpecification?.priceCurrency || locale.currency;
 
           if (priceValue) {
             result.price = {
@@ -1861,7 +2096,7 @@ function findProduct(data: JsonLdProduct | JsonLdProduct[]): JsonLdProduct | nul
   return null;
 }
 
-function extractGenericPrice($: CheerioAPI): ParsedPrice | null {
+function extractGenericPrice($: CheerioAPI, locale: PageLocale): ParsedPrice | null {
   const prices: ParsedPrice[] = [];
 
   for (const selector of genericPriceSelectors) {
@@ -1897,22 +2132,7 @@ function extractGenericPrice($: CheerioAPI): ParsedPrice | null {
             $el.closest('[class*="price"]').text(),
           ];
 
-          for (const source of textSources) {
-            if (!source) continue;
-            // Look for known currency codes first (more specific)
-            const currencyCodeMatch = source.match(/\b(CHF|EUR|GBP|USD|CAD|AUD|JPY|INR)\b/i);
-            if (currencyCodeMatch) {
-              currency = currencyCodeMatch[1].toUpperCase();
-              break;
-            }
-            // Then try currency symbols
-            const symbolMatch = source.match(/([$€£¥₹])/);
-            if (symbolMatch) {
-              const symbolMap: Record<string, string> = { '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR' };
-              currency = symbolMap[symbolMatch[1]] || 'USD';
-              break;
-            }
-          }
+          currency = currencyFromText(textSources, locale);
 
           prices.push({ price, currency });
           return;
@@ -1920,7 +2140,7 @@ function extractGenericPrice($: CheerioAPI): ParsedPrice | null {
       }
 
       const priceStr = content || dataPrice || text;
-      const parsed = parsePrice(priceStr);
+      const parsed = parsePrice(priceStr, locale.hint, locale.currency);
       if (parsed && parsed.price > 0) {
         prices.push(parsed);
       }
@@ -1978,6 +2198,23 @@ function extractGenericStockStatus($: CheerioAPI): StockStatus {
   if (availability.toLowerCase().includes('instock') ||
       availability.toLowerCase().includes('available')) {
     return 'in_stock';
+  }
+
+  // Brazilian Portuguese wording. The English heuristics below never fire on a
+  // pt-BR page: BR stores say "Produto indisponível" / "Esgotado" /
+  // "Avise-me quando chegar", not "out of stock". Checked before the English
+  // pass and only acted on when it actually decides something, so English
+  // pages are unaffected.
+  const htmlLang = ($('html').attr('lang') || '').toLowerCase();
+  if (htmlLang.startsWith('pt')) {
+    const ptArea = $('main, [role="main"], #main, .product-detail, .pdp-main, body')
+      .first()
+      .text()
+      .slice(0, 8000);
+    const ptStatus = brStockStatusFromText(ptArea);
+    if (ptStatus !== 'unknown') {
+      return ptStatus;
+    }
   }
 
   // Be conservative - only check main product area text, not entire body

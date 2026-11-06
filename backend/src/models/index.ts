@@ -509,7 +509,7 @@ export const productQueries = {
     url: string,
     name: string | null,
     imageUrl: string | null,
-    refreshInterval: number = 3600,
+    refreshInterval: number = 86400,
     stockStatus: StockStatus = 'unknown'
   ): Promise<Product> => {
     // Set initial next_check_at to a random time within the refresh interval

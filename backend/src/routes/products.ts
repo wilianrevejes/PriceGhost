@@ -50,7 +50,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
         url,
         scrapedData.name,
         scrapedData.imageUrl,
-        refresh_interval || 3600,
+        refresh_interval || 86400,
         scrapedData.stockStatus
       );
 
@@ -135,7 +135,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
       url,
       scrapedData.name,
       scrapedData.imageUrl,
-      refresh_interval || 3600,
+      refresh_interval || 86400,
       scrapedData.stockStatus
     );
 
